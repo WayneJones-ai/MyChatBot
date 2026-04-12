@@ -1,0 +1,16 @@
+# 忽略大模型相关的大文件
+*.bin
+*.pth
+*.safetensors
+*.jsonl
+*.json
+*.csv
+*.parquet
+
+# 忽略你的 tokenizer 文件夹（根据实际路径修改）
+tokenizer_15k/
+train/data/
+# 忽略临时文件和日志
+__pycache__/
+*.pyc
+logs/
