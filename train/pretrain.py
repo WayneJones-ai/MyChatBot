@@ -3,9 +3,10 @@ import math
 import time
 import numpy as np
 import torch
+torch.multiprocessing.set_sharing_strategy('file_system')
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+import swanlab
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'model'))
 from mychatbot import MyChatbot
@@ -22,34 +23,28 @@ class PretrainDataset(Dataset):
         self.block_size = block_size
 
     def __len__(self):
-        # 每个样本占 block_size+1 个 token（多1个用来错位做label）
         return (len(self.data) - 1) // self.block_size
 
     def __getitem__(self, idx):
         start = idx * self.block_size
         chunk = self.data[start : start + self.block_size + 1]
         chunk = torch.from_numpy(chunk.astype(np.int64))
-        input_ids = chunk[:-1]   # [0, block_size)
-        labels    = chunk[1:]    # [1, block_size+1)  ← 错位一格
+        input_ids = chunk[:-1]
+        labels    = chunk[1:]
         return input_ids, labels
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. 学习率调度：warmup + cosine decay
+# 2. 学习率调度：warmup + cosine decay（按轮内步数计算）
 # ─────────────────────────────────────────────────────────────
 
 def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
-    # warmup 阶段：线性从 0 升到 max_lr
     if step < warmup_steps:
         return max_lr * step / warmup_steps
-
-    # 训练结束后：保持最小学习率
     if step >= max_steps:
         return min_lr
-
-    # cosine decay 阶段：从 max_lr 平滑降到 min_lr
-    progress = (step - warmup_steps) / (max_steps - warmup_steps)  # 0 → 1
-    cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))          # 1 → 0
+    progress = (step - warmup_steps) / (max_steps - warmup_steps)
+    cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + cosine * (max_lr - min_lr)
 
 
@@ -60,7 +55,7 @@ def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: 
 def train_step(
     model: MyChatbot,
     optimizer: torch.optim.Optimizer,
-    batch_iter,             # dataloader 的迭代器
+    batch_iter,
     device: torch.device,
     accumulation_steps: int,
     scaler: torch.cuda.amp.GradScaler,
@@ -68,36 +63,25 @@ def train_step(
     model.train()
     total_loss = 0.0
 
-    for micro_step in range(accumulation_steps):
+    for _ in range(accumulation_steps):
         input_ids, labels = next(batch_iter)
         input_ids = input_ids.to(device)
         labels    = labels.to(device)
 
-        # 混合精度（AMP）：用 float16 做前向，节省显存、加快速度
-        # 为什么不全程 float16？因为 float16 精度低，累积梯度会有误差，
-        # 所以梯度更新仍用 float32，只有前向用 float16。
         with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
-            logits = model(input_ids)           # [B, seq, vocab_size]
-
-            # cross entropy 要求:
-            #   input: [N, vocab_size]  ← 把 batch 和 seq 维合并
-            #   target: [N]
+            logits = model(input_ids)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
-                ignore_index=-1,    # -1 位置不计入损失（padding 用）
+                ignore_index=-1,
             )
-            # 除以 accumulation_steps：让累积后的梯度等价于单次大 batch 的平均
             loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
         total_loss += loss.item()
 
-    # 梯度裁剪：防止梯度爆炸
-    # 当梯度的 L2 范数超过 max_norm，就等比例缩小所有梯度
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad()
@@ -106,29 +90,23 @@ def train_step(
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. 训练循环
-#
-# 这里把所有模块串起来，逻辑是：
-#   for step in range(max_steps):
-#       ① 调整学习率
-#       ② 跑一个 train_step（含梯度累积）
-#       ③ 每隔一段打印日志
-#       ④ 每隔一段保存 checkpoint
+# 4. 训练循环（2 epoch × 20000 steps）
 # ─────────────────────────────────────────────────────────────
 
 def train():
     # ── 超参数配置 ──────────────────────────────────────────
     block_size         = 512
-    batch_size         = 8      # 每个 micro step 的 batch 大小
-    accumulation_steps = 4      # 梯度累积步数，等效 batch = 8*4 = 32
-    max_steps          = 10000
+    batch_size         = 8
+    accumulation_steps = 4
+    num_epochs         = 2        # ← epoch 数
+    steps_per_epoch    = 20000    # ← 每个 epoch 的训练步数
     warmup_steps       = 200
     max_lr             = 3e-4
     min_lr             = max_lr * 0.1
-    log_interval       = 50     # 每 50 step 打印一次
-    save_interval      = 500    # 每 500 step 保存一次
+    log_interval       = 50
+    save_interval      = 5000
     save_dir           = "./checkpoints"
-    bin_path           = "train\data\SpongeBobPRO_pretrain_512_final.bin"
+    bin_path           = "/root/autodl-tmp/MyChatBot/train/data/SpongeBobPRO_pretrain_512_final.bin"
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,60 +115,123 @@ def train():
     # ── 模型、优化器 ────────────────────────────────────────
     config = ChatBotConfig()
     model  = MyChatbot(config).to(device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {param_count / 1e6:.2f}M")
 
-    # AdamW：Adam + 权重衰减
-    # 权重衰减是正则化手段，防止参数过大导致过拟合
-    # betas=(0.9, 0.95) 是 LLaMA 的常用设置，比默认 (0.9, 0.999) 更适合语言模型
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=max_lr,
         betas=(0.9, 0.95),
         weight_decay=0.1,
     )
-
-    # GradScaler 配合 AMP 使用：自动处理 float16 下的梯度缩放
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+
+    # ── SwanLab 初始化 ──────────────────────────────────────
+    swanlab.init(
+        project="MyChatbot-Pretrain",
+        experiment_name="mychatbot-pretrain1",
+        config={
+            "block_size":         block_size,
+            "batch_size":         batch_size,
+            "accumulation_steps": accumulation_steps,
+            "effective_batch":    batch_size * accumulation_steps,
+            "num_epochs":         num_epochs,
+            "steps_per_epoch":    steps_per_epoch,
+            "total_steps":        num_epochs * steps_per_epoch,
+            "warmup_steps":       warmup_steps,
+            "max_lr":             max_lr,
+            "min_lr":             min_lr,
+            "weight_decay":       0.1,
+            "betas":              (0.9, 0.95),
+            "param_count_M":      round(param_count / 1e6, 2),
+            "device":             str(device),
+        },
+    )
 
     # ── 数据 ────────────────────────────────────────────────
     dataset    = PretrainDataset(bin_path, block_size)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    # 用 cycle 让 dataloader 无限循环，避免 step 数超过数据集长度时报错
-    from itertools import cycle
-    batch_iter = cycle(iter(dataloader))
+    print(f"数据集大小: {len(dataset)} 个样本，"
+          f"每 epoch {steps_per_epoch} steps × {accumulation_steps} 累积 = "
+          f"{steps_per_epoch * accumulation_steps * batch_size} tokens/epoch")
 
-    # ── 训练循环 ────────────────────────────────────────────
-    t0 = time.time()
-    for step in range(1, max_steps + 1):
+    # ── 外层 epoch 循环 ────────────────────────────────────
+    global_step = 0   # 跨 epoch 的全局步数，用于 SwanLab 横轴对齐
 
-        # ① 调整学习率：每一步都更新
-        lr = get_lr(step, warmup_steps, max_steps, max_lr, min_lr)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    for epoch in range(1, num_epochs + 1):
+        print(f"\n{'='*50}")
+        print(f"Epoch {epoch}/{num_epochs} 开始")
+        print(f"{'='*50}")
 
-        # ② 训练一步（含梯度累积）
-        loss = train_step(model, optimizer, batch_iter, device, accumulation_steps, scaler)
+        # 每个 epoch 重新创建迭代器：新的 shuffle 顺序，数据不足时用 cycle 补齐
+        from itertools import cycle
+        batch_iter = cycle(iter(dataloader))
 
-        # ③ 打印日志
-        if step % log_interval == 0:
-            t1    = time.time()
-            dt    = t1 - t0
-            t0    = t1
-            print(f"step {step:5d} | loss {loss:.4f} | lr {lr:.2e} | {dt/log_interval*1000:.0f}ms/step")
+        t0 = time.time()
 
-        # ④ 保存 checkpoint
-        if step % save_interval == 0:
-            ckpt_path = os.path.join(save_dir, f"step_{step}.pt")
-            torch.save({
-                'step':       step,
-                'model':      model.state_dict(),
-                'optimizer':  optimizer.state_dict(),
-                'loss':       loss,
-                'config':     config,
-            }, ckpt_path)
-            print(f"✅ checkpoint 保存至 {ckpt_path}")
+        # ── 内层 step 循环 ─────────────────────────────────
+        for local_step in range(1, steps_per_epoch + 1):
+            global_step += 1
 
-    print("🎉 预训练完成")
+            # ① 学习率：基于轮内步数，每个 epoch 独立走一遍 warmup → cosine
+            lr = get_lr(global_step, warmup_steps, num_epochs * steps_per_epoch, max_lr, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+
+            # ② 训练一步
+            loss = train_step(model, optimizer, batch_iter, device, accumulation_steps, scaler)
+
+            # ③ 打印 + SwanLab 记录
+            if local_step % log_interval == 0:
+                t1 = time.time()
+                dt = t1 - t0
+                t0 = t1
+                ms_per_step = dt / log_interval * 1000
+                print(f"  epoch {epoch} | step {local_step:5d}/{steps_per_epoch} "
+                      f"| global {global_step:6d} "
+                      f"| loss {loss:.4f} | lr {lr:.2e} | {ms_per_step:.0f}ms/step")
+
+                swanlab.log(
+                    {
+                        "train/loss":        loss,
+                        "train/lr":          lr,
+                        "train/ms_per_step": ms_per_step,
+                        "train/perplexity":  math.exp(min(loss, 20)),
+                        "train/epoch":       epoch,   # 方便在 SwanLab 里按 epoch 筛选曲线
+                    },
+                    step=global_step,   # 横轴用全局步数，两个 epoch 曲线连续不断档
+                )
+
+            # ④ 按全局步数定期保存 checkpoint
+            if global_step % save_interval == 0:
+                ckpt_path = os.path.join(save_dir, f"epoch{epoch}_step{global_step}.pt")
+                torch.save({
+                    'epoch':       epoch,
+                    'local_step':  local_step,
+                    'global_step': global_step,
+                    'model':       model.state_dict(),
+                    'optimizer':   optimizer.state_dict(),
+                    'loss':        loss,
+                    'config':      config,
+                }, ckpt_path)
+                print(f"  ✅ checkpoint 保存至 {ckpt_path}")
+                swanlab.log({"checkpoint/saved_at": global_step}, step=global_step)
+
+        # ── epoch 结束：额外保存一次完整 checkpoint ────────
+        epoch_ckpt = os.path.join(save_dir, f"epoch{epoch}_final.pt")
+        torch.save({
+            'epoch':       epoch,
+            'global_step': global_step,
+            'model':       model.state_dict(),
+            'optimizer':   optimizer.state_dict(),
+            'loss':        loss,
+            'config':      config,
+        }, epoch_ckpt)
+        print(f"\n✅ Epoch {epoch} 完成，模型保存至 {epoch_ckpt}")
+        swanlab.log({"epoch/final_loss": loss, "epoch/index": epoch}, step=global_step)
+
+    print("\n🎉 预训练完成")
+    swanlab.finish()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from config import ChatBotConfig
+from .config import ChatBotConfig
 import torch.nn.functional as F
 
 

@@ -1,12 +1,13 @@
 # 忽略大模型相关的大文件
 *.bin
 *.pth
+*.pt
 *.safetensors
 *.jsonl
 *.json
 *.csv
 *.parquet
-
+*.out
 # 忽略你的 tokenizer 文件夹（根据实际路径修改）
 tokenizer_15k/
 train/data/
