@@ -425,8 +425,8 @@ def parse_args():
     p.add_argument("--min_lr_ratio",  type=float, default=0.1,          help="最小学习率 = lr * min_lr_ratio")
 
     # 日志与保存
-    p.add_argument("--log_interval",  type=int,   default=100,           help="每隔多少 step 打印一次")
-    p.add_argument("--save_steps",    type=int,   default=5000,            help="每隔多少 step 保存一次，0=不保存")
+    p.add_argument("--log_interval",  type=int,   default=1000,           help="每隔多少 step 打印一次")
+    p.add_argument("--save_steps",    type=int,   default=150000,            help="每隔多少 step 保存一次，0=不保存")
     p.add_argument("--num_workers",   type=int,   default=2)
 
     return p.parse_args()
